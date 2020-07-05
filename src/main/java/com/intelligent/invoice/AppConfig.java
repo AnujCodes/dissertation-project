@@ -9,6 +9,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class AppConfig {
 	private String serviceAccountFile;
+	
+	private String sample1;
 
 	private List<String> origins;
 
@@ -26,6 +28,14 @@ public class AppConfig {
 
 	public void setOrigins(List<String> origins) {
 		this.origins = origins;
+	}
+
+	public String getSample1() {
+		return sample1;
+	}
+
+	public void setSample1(String sample1) {
+		this.sample1 = sample1;
 	}
 
 }

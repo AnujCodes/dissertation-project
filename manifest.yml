@@ -1,0 +1,12 @@
+---
+applications:
+- name: dissertation-project
+  buildpack: sap_java_buildpack
+  instances: 1
+  memory: 1024MB
+  host: dissertation-project
+  path: target/googlevision.jar
+#  services:
+#  - instance_hana_hdi
+  env:
+    LOG_ROOT_LEVEL: 'INFO'

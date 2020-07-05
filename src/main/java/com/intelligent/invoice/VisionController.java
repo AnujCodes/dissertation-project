@@ -1,27 +1,31 @@
 package com.intelligent.invoice;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import org.apache.commons.httpclient.HttpClient;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 import com.google.api.gax.core.FixedCredentialsProvider;
 import com.google.auth.oauth2.GoogleCredentials;
@@ -51,8 +55,32 @@ import com.google.cloud.vision.v1.SafeSearchAnnotation;
 import com.google.cloud.vision.v1.WebDetection;
 import com.google.cloud.vision.v1.WebDetection.WebImage;
 import com.google.cloud.vision.v1.WebDetection.WebPage;
-
-import com.intelligent.invoice.dto.*;
+import com.google.gson.Gson;
+import com.intelligent.invoice.dto.Face;
+import com.intelligent.invoice.dto.FaceLandmark;
+import com.intelligent.invoice.dto.InvoiceEntity;
+import com.intelligent.invoice.dto.InvoiceReport;
+import com.intelligent.invoice.dto.Label;
+import com.intelligent.invoice.dto.Landmark;
+import com.intelligent.invoice.dto.LngLat;
+import com.intelligent.invoice.dto.Logo;
+import com.intelligent.invoice.dto.ReportStatus;
+import com.intelligent.invoice.dto.SafeSearch;
+import com.intelligent.invoice.dto.Text;
+import com.intelligent.invoice.dto.Vertex;
+import com.intelligent.invoice.dto.VisionResult;
+import com.intelligent.invoice.dto.VisionResultEntity;
+import com.intelligent.invoice.dto.Web;
+import com.intelligent.invoice.dto.WebEntity;
+import com.intelligent.invoice.dto.WebUrl;
+import com.intelligent.invoice.repository.InvoiceRepository;
+import com.intelligent.invoice.repository.ReportRepository;
+import com.intelligent.invoice.service.ProcessInvoice;
+import com.squareup.okhttp.MediaType;
+import com.squareup.okhttp.OkHttpClient;
+import com.squareup.okhttp.Request;
+import com.squareup.okhttp.RequestBody;
+import com.squareup.okhttp.Response;
 
 @RestController
 @CrossOrigin
@@ -61,11 +89,23 @@ public class VisionController {
 	private static final String BUCKET_NAME = "vision_demo_2020";
 	private Storage storage;
 	private ImageAnnotatorSettings imageAnnotatorSettings;
+	
+	@Autowired
+	private InvoiceRepository invoiceRepository;
+	
+	@Autowired
+	private ReportRepository reportRepository;
+	
+	@Autowired
+	private ProcessInvoice processInvoice;
+	
+	private final Logger LOG = LoggerFactory.getLogger(this.getClass());
 
 	public VisionController(AppConfig appConfig) {
-		Path serviceAccountFile = Paths.get(appConfig.getServiceAccountFile());
+//		Path serviceAccountFile = Paths.get(appConfig.getServiceAccountFile());
 
-		try (InputStream is = Files.newInputStream(serviceAccountFile)) {
+		try (InputStream is = getClass()
+			    .getClassLoader().getResourceAsStream(appConfig.getServiceAccountFile())) {
 			GoogleCredentials credentials = GoogleCredentials.fromStream(is);
 			StorageOptions options = StorageOptions.newBuilder()
 					.setCredentials(credentials).build();
@@ -98,15 +138,135 @@ public class VisionController {
 	}
 
 	@PostMapping("/signurl")
-	public SignUrlResponse getSignUrl(@RequestParam("contentType") String contentType) {
+	public SignUrlResponse getSignUrl(@RequestParam("contentType") String contentType, String FileName) {
 		String uuid = UUID.randomUUID().toString();
 		String url = this.storage.signUrl(
-				BlobInfo.newBuilder(BUCKET_NAME, uuid).setContentType(contentType)
+				BlobInfo.newBuilder(BUCKET_NAME, FileName).setContentType(contentType)
 						.build(),
 				3, TimeUnit.HOURS, SignUrlOption.httpMethod(HttpMethod.PUT),
 				SignUrlOption.withContentType()).toString();
 		return new SignUrlResponse(uuid, url);
 	}
+	
+	@SuppressWarnings("unused")
+	@PostMapping("/image/parse")
+	public InvoiceEntity parseInvoice(@RequestParam("imageFile") MultipartFile imageFile) throws IOException {
+		
+		String FileName = imageFile.getOriginalFilename();
+		try {
+			SignUrlResponse signUrlResponse = getSignUrl("image/jpeg", FileName);
+			String signUrl = signUrlResponse.getUrl();
+			String uuid = signUrlResponse.getUuid();
+			
+			File convFile = new File(System.getProperty("java.io.tmpdir")+"/"+FileName);
+			imageFile.transferTo(convFile);
+			
+			OkHttpClient client = new OkHttpClient();
+					MediaType mediaType = MediaType.parse("image/jpeg");
+					RequestBody body = com.squareup.okhttp.RequestBody.create(mediaType, convFile);
+					Request request = new Request.Builder()
+					  .url(signUrl).method("PUT", body)
+					  .addHeader("Content-Type", "image/jpeg")
+					  .build();
+					Response response = client.newCall(request).execute();
+			
+			HttpClient client2 = new HttpClient();
+			
+			LOG.info("File uploaded to GCS with Status Code: " + response.code());
+			
+			Request request2 = new Request.Builder()
+					  .url("https://project-vision-267813.df.r.appspot.com/image/ocr?filename="+FileName)
+					  .method("GET", null)
+					  .addHeader("Content-Type", "image/jpeg")
+					  .build();
+					Response response2 = client.newCall(request2).execute();
+	        
+	        String parsedImageJson = response2.body().string();
+			
+			VisionResultEntity data = new Gson().fromJson(parsedImageJson, VisionResultEntity.class);
+			InvoiceEntity invoiceEntity = new InvoiceEntity();
+			for(int i=0; i<data.getResponse().size(); i++) {
+				for(int j=0; j<data.getResponse().get(i).size(); j++) {
+					if(processInvoice.checkForInvoiceId(data.getResponse().get(i).get(j))) {
+						if((j+1) < data.getResponse().get(i).size()) {
+							invoiceEntity.setInvoiceId(data.getResponse().get(i).get(j+1));
+						}
+						
+					} else if(processInvoice.checkForInvoiceDate(data.getResponse().get(i).get(j))) {
+						if((j+1) < data.getResponse().get(i).size()) {
+							if(processInvoice.checkValidDate(data.getResponse().get(i).get(j+1)) ) {
+								invoiceEntity.setInvoiceDate(data.getResponse().get(i).get(j+1));
+							}
+						}
+						
+					} else if(processInvoice.checkForAmount(data.getResponse().get(i).get(j))) {
+						if((j+1) < data.getResponse().get(i).size()) {
+							invoiceEntity.setCurrency(processInvoice.getCurrency(data.getResponse().get(i).get(j+1)));
+							String amount = processInvoice.getAmount(data.getResponse().get(i).get(j+1));
+							if (!StringUtils.isEmpty(invoiceEntity.getTotalAmount())) {
+								if(Double.parseDouble(amount) > Double.parseDouble(invoiceEntity.getTotalAmount()))
+									invoiceEntity.setTotalAmount(amount);
+							} else {
+								invoiceEntity.setTotalAmount(amount);
+							}
+						}
+						
+					}
+				}
+			}
+			
+			invoiceRepository.save(invoiceEntity);
+			return invoiceEntity;
+		} catch(Exception e) {
+			LOG.error("Error occured while parsing the image: " + e.getMessage());
+		} finally {
+			this.storage.delete(BlobId.of(BUCKET_NAME, FileName));
+		}
+		return null;
+		
+	}
+	
+	@PostMapping("/report")
+	public InvoiceReport generateReport(@org.springframework.web.bind.annotation.RequestBody InvoiceReport report) throws IOException {
+		LOG.info("Recieved report data: " + report.getEmployeeId());
+		try {
+			report.setStatus(ReportStatus.NEW);
+			reportRepository.save(report);
+		} catch(Exception e) {
+			LOG.error("Invalid Report: ", e.getMessage());
+		}
+		return report;
+	}
+	
+	@GetMapping("/fetch/report")
+	public List<InvoiceReport> getAllReport() throws IOException {
+		LOG.info("Recieved request for getAllReport: ");
+		Iterable<InvoiceReport> reports = null;
+		try {
+			reports = reportRepository.findAll();
+		} catch(Exception e) {
+			LOG.error("Invalid Report: " + e.getMessage());
+		}
+		List<InvoiceReport> result = new ArrayList<InvoiceReport>();
+		reports.forEach(result::add);
+		return result;
+	}
+	
+	@PostMapping("/approve/report")
+	public InvoiceReport approveReport(@RequestParam("id") long id) throws IOException {
+		LOG.info("Recieved request to approve employee report: " + id);
+		Optional<InvoiceReport> report = null;
+		try {
+			report = reportRepository.findById(id);
+			report.get().setStatus(ReportStatus.APPROVED);
+			reportRepository.save(report.get());
+		} catch(Exception e) {
+			LOG.error("Invalid Report: " + e.getMessage());
+		}
+		return report.get();
+	}
+	
+
 
 	@PostMapping("/vision")
 	public VisionResult vision(@RequestParam("uuid") String uuid) throws IOException {
